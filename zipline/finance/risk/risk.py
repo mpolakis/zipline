@@ -51,6 +51,9 @@ Risk Report
     |                 | for the portfolio returns between self.start_date  |
     |                 | and self.end_date.                                 |
     +-----------------+----------------------------------------------------+
+    | max_leverage    | The largest gross leverage between self.start_date |
+    |                 | and self.end_date                                  |
+    +-----------------+----------------------------------------------------+
 
 
 """
@@ -151,11 +154,8 @@ def information_ratio(algorithm_returns, benchmark_returns):
 
     relative_deviation = relative_returns.std(ddof=1)
 
-    if (
-        zp_math.tolerant_equals(relative_deviation, 0)
-        or
-        np.isnan(relative_deviation)
-    ):
+    if zp_math.tolerant_equals(relative_deviation, 0) or \
+       np.isnan(relative_deviation):
         return 0.0
 
     return np.mean(relative_returns) / relative_deviation

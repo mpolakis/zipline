@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2015 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,6 +59,8 @@ Performance Tracking
 
 from __future__ import division
 import logbook
+import pickle
+from six import iteritems
 
 import numpy as np
 import pandas as pd
@@ -70,6 +72,10 @@ from zipline.finance import trading
 from . period import PerformancePeriod
 
 from zipline.finance.trading import with_environment
+from zipline.utils.serialization_utils import (
+    VERSION_LABEL
+)
+from . position_tracker import PositionTracker
 
 log = logbook.Logger('Performance')
 
@@ -103,6 +109,8 @@ class PerformanceTracker(object):
         self.dividend_frame = pd.DataFrame()
         self._dividend_count = 0
 
+        self.position_tracker = PositionTracker()
+
         self.perf_periods = []
 
         if self.emission_rate == 'daily':
@@ -113,12 +121,9 @@ class PerformanceTracker(object):
                 risk.RiskMetricsCumulative(self.sim_params)
 
         elif self.emission_rate == 'minute':
-            self.all_benchmark_returns = pd.Series(
-                index=env.minutes_for_days_in_range(
-                    self.sim_params.first_open,
-                    self.sim_params.last_close
-                )
-            )
+            self.all_benchmark_returns = pd.Series(index=pd.date_range(
+                self.sim_params.first_open, self.sim_params.last_close,
+                freq='Min'))
             self.intraday_risk_metrics = \
                 risk.RiskMetricsCumulative(self.sim_params)
 
@@ -141,6 +146,7 @@ class PerformanceTracker(object):
                 # don't serialize positions for cumualtive period
                 serialize_positions=False
             )
+            self.minute_performance.position_tracker = self.position_tracker
             self.perf_periods.append(self.minute_performance)
 
         # this performance period will span the entire simulation from
@@ -156,8 +162,9 @@ class PerformanceTracker(object):
             keep_transactions=False,
             keep_orders=False,
             # don't serialize positions for cumualtive period
-            serialize_positions=False
+            serialize_positions=False,
         )
+        self.cumulative_performance.position_tracker = self.position_tracker
         self.perf_periods.append(self.cumulative_performance)
 
         # this performance period will span just the current market day
@@ -169,16 +176,20 @@ class PerformanceTracker(object):
             self.market_close,
             keep_transactions=True,
             keep_orders=True,
-            serialize_positions=True
+            serialize_positions=True,
         )
+        self.todays_performance.position_tracker = self.position_tracker
+
         self.perf_periods.append(self.todays_performance)
 
         self.saved_dt = self.period_start
-        self.returns = pd.Series(index=self.trading_days)
         # one indexed so that we reach 100%
         self.day_count = 0.0
         self.txn_count = 0
         self.event_count = 0
+
+        self.account_needs_update = True
+        self._account = None
 
     def __repr__(self):
         return "%s(%r)" % (
@@ -241,9 +252,15 @@ class PerformanceTracker(object):
         return self.cumulative_performance.as_portfolio()
 
     def get_account(self, performance_needs_update):
+        if self.account_needs_update:
+            self._get_account(performance_needs_update)
+        return self._account
+
+    def _get_account(self, performance_needs_update):
         if performance_needs_update:
             self.update_performance()
-        return self.cumulative_performance.as_account()
+        self._account = self.cumulative_performance.as_account()
+        self.account_needs_update = False
 
     def to_dict(self, emission_type=None):
         """
@@ -275,29 +292,32 @@ class PerformanceTracker(object):
 
         if event.type == zp.DATASOURCE_TYPE.TRADE:
             # update last sale
-            for perf_period in self.perf_periods:
-                perf_period.update_last_sale(event)
+            self.position_tracker.update_last_sale(event)
 
         elif event.type == zp.DATASOURCE_TYPE.TRANSACTION:
             # Trade simulation always follows a transaction with the
             # TRADE event that was used to simulate it, so we don't
             # check for end of day rollover messages here.
             self.txn_count += 1
+            self.position_tracker.execute_transaction(event)
             for perf_period in self.perf_periods:
-                perf_period.execute_transaction(event)
+                perf_period.handle_execution(event)
 
         elif event.type == zp.DATASOURCE_TYPE.DIVIDEND:
             log.info("Ignoring DIVIDEND event.")
 
         elif event.type == zp.DATASOURCE_TYPE.SPLIT:
-            for perf_period in self.perf_periods:
-                perf_period.handle_split(event)
+            leftover_cash = self.position_tracker.handle_split(event)
+            if leftover_cash > 0:
+                for perf_period in self.perf_periods:
+                    perf_period.handle_cash_payment(leftover_cash)
 
         elif event.type == zp.DATASOURCE_TYPE.ORDER:
             for perf_period in self.perf_periods:
                 perf_period.record_order(event)
 
         elif event.type == zp.DATASOURCE_TYPE.COMMISSION:
+            self.position_tracker.handle_commission(event)
             for perf_period in self.perf_periods:
                 perf_period.handle_commission(event)
 
@@ -305,11 +325,8 @@ class PerformanceTracker(object):
             pass
 
         elif event.type == zp.DATASOURCE_TYPE.BENCHMARK:
-            if (
-                self.sim_params.data_frequency == 'minute'
-                and
-                self.sim_params.emission_rate == 'daily'
-            ):
+            if self.sim_params.data_frequency == 'minute' and \
+               self.sim_params.emission_rate == 'daily':
                 # Minute data benchmarks should have a timestamp of market
                 # close, so that calculations are triggered at the right time.
                 # However, risk module uses midnight as the 'day'
@@ -366,21 +383,23 @@ class PerformanceTracker(object):
         pay_date_mask = (self.dividend_frame['pay_date'] == next_trading_day)
         dividends_payable = self.dividend_frame[pay_date_mask]
 
-        for period in self.perf_periods:
-            # TODO SS: There's no reason we should have to duplicate this
-            #          computation, but we do it currently because each perf
-            #          period maintains its own separate positiondict.  We
-            #          should eventually remove this duplication and give each
-            #          period a (preferably read-only) DataFrame of positions.
-            if len(dividends_earnable):
-                period.earn_dividends(dividends_earnable)
+        position_tracker = self.position_tracker
+        if len(dividends_earnable):
+            position_tracker.earn_dividends(dividends_earnable)
 
-            if len(dividends_payable):
-                period.pay_dividends(dividends_payable)
+        if not len(dividends_payable):
+            return
+
+        net_cash_payment = position_tracker.pay_dividends(dividends_payable)
+
+        for period in self.perf_periods:
+            # notify periods to update their stats
+            period.handle_dividends_paid(net_cash_payment)
 
     def handle_minute_close(self, dt):
         self.update_performance()
         todays_date = normalize_date(dt)
+        account = self.get_account(True)
 
         minute_returns = self.minute_performance.returns
         self.minute_performance.rollover()
@@ -388,27 +407,29 @@ class PerformanceTracker(object):
         # returns for the bench and the algo
         self.intraday_risk_metrics.update(dt,
                                           minute_returns,
-                                          self.all_benchmark_returns[dt])
+                                          self.all_benchmark_returns[dt],
+                                          account)
 
         bench_since_open = \
             self.intraday_risk_metrics.benchmark_cumulative_returns[dt]
 
         self.cumulative_risk_metrics.update(todays_date,
                                             self.todays_performance.returns,
-                                            bench_since_open)
+                                            bench_since_open,
+                                            account)
 
         # if this is the close, save the returns objects for cumulative risk
         # calculations and update dividends for the next day.
         if dt == self.market_close:
             self.check_upcoming_dividends(todays_date)
-            self.returns[todays_date] = self.todays_performance.returns
+
+        self.account_needs_update = True
 
     def handle_intraday_market_close(self, new_mkt_open, new_mkt_close):
         """
         Function called at market close only when emitting at minutely
         frequency.
         """
-
         # update_performance should have been called in handle_minute_close
         # so it is not repeated here.
         self.intraday_risk_metrics = \
@@ -418,6 +439,8 @@ class PerformanceTracker(object):
         self.market_open = new_mkt_open
         self.market_close = new_mkt_close
 
+        self.account_needs_update = True
+
     def handle_market_close_daily(self):
         """
         Function called after handle_data when running with daily emission
@@ -425,15 +448,14 @@ class PerformanceTracker(object):
         """
         self.update_performance()
         completed_date = normalize_date(self.market_close)
-
-        # add the return results from today to the returns series
-        self.returns[completed_date] = self.todays_performance.returns
+        account = self.get_account(True)
 
         # update risk metrics for cumulative performance
         self.cumulative_risk_metrics.update(
             completed_date,
             self.todays_performance.returns,
-            self.all_benchmark_returns[completed_date])
+            self.all_benchmark_returns[completed_date],
+            account)
 
         # increment the day counter before we move markers forward.
         self.day_count += 1.0
@@ -459,6 +481,8 @@ class PerformanceTracker(object):
 
         self.check_upcoming_dividends(completed_date)
 
+        self.account_needs_update = True
+
         return daily_update
 
     def handle_simulation_end(self):
@@ -476,10 +500,53 @@ class PerformanceTracker(object):
 
         bms = self.cumulative_risk_metrics.benchmark_returns
         ars = self.cumulative_risk_metrics.algorithm_returns
+        acl = self.cumulative_risk_metrics.algorithm_cumulative_leverages
         self.risk_report = risk.RiskReport(
             ars,
             self.sim_params,
-            benchmark_returns=bms)
+            benchmark_returns=bms,
+            algorithm_leverages=acl)
 
         risk_dict = self.risk_report.to_dict()
         return risk_dict
+
+    def __getstate__(self):
+        state_dict = \
+            {k: v for k, v in iteritems(self.__dict__)
+                if not k.startswith('_')}
+
+        state_dict['dividend_frame'] = pickle.dumps(self.dividend_frame)
+
+        state_dict['_dividend_count'] = self._dividend_count
+
+        # we already store perf periods as attributes
+        del state_dict['perf_periods']
+
+        STATE_VERSION = 3
+        state_dict[VERSION_LABEL] = STATE_VERSION
+
+        return state_dict
+
+    def __setstate__(self, state):
+
+        OLDEST_SUPPORTED_STATE = 3
+        version = state.pop(VERSION_LABEL)
+
+        if version < OLDEST_SUPPORTED_STATE:
+            raise BaseException("PerformanceTracker saved state is too old.")
+
+        self.__dict__.update(state)
+
+        # Handle the dividend frame specially
+        self.dividend_frame = pickle.loads(state['dividend_frame'])
+
+        # properly setup the perf periods
+        self.perf_periods = []
+        p_types = ['cumulative', 'todays', 'minute']
+        for p_type in p_types:
+            name = p_type + '_performance'
+            period = getattr(self, name, None)
+            if period is None:
+                continue
+            period._position_tracker = self.position_tracker
+            self.perf_periods.append(period)

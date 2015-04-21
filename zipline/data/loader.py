@@ -31,10 +31,8 @@ from six import iteritems
 from . import benchmarks
 from . benchmarks import get_benchmark_returns
 
-from zipline.utils.tradingcalendar import (
-    trading_day,
-    trading_days
-)
+from zipline.utils.tradingcalendar import trading_day as trading_day_nyse
+from zipline.utils.tradingcalendar import trading_days as trading_days_nyse
 
 logger = logbook.Logger('Loader')
 
@@ -154,15 +152,19 @@ def get_benchmark_filename(symbol):
     return "%s_benchmark.csv" % symbol
 
 
-def load_market_data(bm_symbol='^GSPC'):
+def load_market_data(trading_day=trading_day_nyse,
+                     trading_days=trading_days_nyse, bm_symbol='^GSPC'):
     bm_filepath = get_data_filepath(get_benchmark_filename(bm_symbol))
     try:
         saved_benchmarks = pd.Series.from_csv(bm_filepath)
-    except (OSError, IOError):
-        print("""
-data files aren't distributed with source.
-Fetching data from Yahoo Finance.
-""".strip())
+    except (OSError, IOError, ValueError):
+        logger.info(
+            "No cache found at {path}. "
+            "Downloading benchmark data for '{symbol}'.",
+            symbol=bm_symbol,
+            path=bm_filepath,
+        )
+
         dump_benchmarks(bm_symbol)
         saved_benchmarks = pd.Series.from_csv(bm_filepath)
 
@@ -180,21 +182,18 @@ Fetching data from Yahoo Finance.
 
     # If more than 1 trading days has elapsed since the last day where
     # we have data,then we need to update
-    if len(days_up_to_now) - last_bm_date_offset > 1:
+    # We're doing "> 2" rather than "> 1" because we're subtracting an array
+    # _length_ from an array _index_, and therefore even if we had data up to
+    # and including the current day, the difference would still be 1.
+    if len(days_up_to_now) - last_bm_date_offset > 2:
         benchmark_returns = update_benchmarks(bm_symbol, last_bm_date)
-        if (
-            benchmark_returns.index.tz is None
-            or
-            benchmark_returns.index.tz.zone != 'UTC'
-        ):
+        if benchmark_returns.index.tz is None or \
+           benchmark_returns.index.tz.zone != 'UTC':
             benchmark_returns = benchmark_returns.tz_localize('UTC')
     else:
         benchmark_returns = saved_benchmarks
-        if (
-            benchmark_returns.index.tz is None
-            or
-            benchmark_returns.index.tz.zone != 'UTC'
-        ):
+        if benchmark_returns.index.tz is None or\
+           benchmark_returns.index.tz.zone != 'UTC':
             benchmark_returns = benchmark_returns.tz_localize('UTC')
 
     # Get treasury curve module, filename & source from mapping.
@@ -205,11 +204,14 @@ Fetching data from Yahoo Finance.
     tr_filepath = get_data_filepath(filename)
     try:
         saved_curves = pd.DataFrame.from_csv(tr_filepath)
-    except (OSError, IOError):
-        print("""
-data files aren't distributed with source.
-Fetching data from {0}
-""".format(source).strip())
+    except (OSError, IOError, ValueError):
+        logger.info(
+            "No cache found at {path}. "
+            "Downloading treasury data from {source}.",
+            path=tr_filepath,
+            source=source,
+        )
+
         dump_treasury_curves(module, filename)
         saved_curves = pd.DataFrame.from_csv(tr_filepath)
 
@@ -221,22 +223,13 @@ Fetching data from {0}
 
     # If more than 1 trading days has elapsed since the last day where
     # we have data,then we need to update
-    if len(days_up_to_now) - last_tr_date_offset > 1:
+    # Comment above explains why this is "> 2".
+    if len(days_up_to_now) - last_tr_date_offset > 2:
         treasury_curves = dump_treasury_curves(module, filename)
     else:
         treasury_curves = saved_curves.tz_localize('UTC')
 
-    tr_curves = {}
-    for tr_dt, curve in treasury_curves.T.iteritems():
-        # tr_dt = tr_dt.replace(hour=0, minute=0, second=0, microsecond=0,
-        #                       tzinfo=pytz.utc)
-        tr_curves[tr_dt] = curve.to_dict()
-
-    tr_curves = OrderedDict(sorted(
-        ((dt, c) for dt, c in iteritems(tr_curves)),
-        key=lambda t: t[0]))
-
-    return benchmark_returns, tr_curves
+    return benchmark_returns, treasury_curves
 
 
 def _load_raw_yahoo_data(indexes=None, stocks=None, start=None, end=None):

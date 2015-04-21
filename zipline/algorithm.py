@@ -35,6 +35,7 @@ from zipline.errors import (
     OverrideCommissionPostInit,
     OverrideSlippagePostInit,
     RegisterTradingControlPostInit,
+    RegisterAccountControlPostInit,
     UnsupportedCommissionModel,
     UnsupportedOrderParameters,
     UnsupportedSlippageModel,
@@ -48,6 +49,7 @@ from zipline.finance.controls import (
     MaxOrderCount,
     MaxOrderSize,
     MaxPositionSize,
+    MaxLeverage,
     RestrictedListOrder
 )
 from zipline.finance.execution import (
@@ -62,13 +64,9 @@ from zipline.finance.slippage import (
     SlippageModel,
     transact_partial
 )
-from zipline.gens.composites import (
-    date_sorted_sources,
-    sequential_transforms,
-)
+from zipline.gens.composites import date_sorted_sources
 from zipline.gens.tradesimulation import AlgorithmSimulator
 from zipline.sources import DataFrameSource, DataPanelSource
-from zipline.transforms.utils import StatefulTransform
 from zipline.utils.api_support import ZiplineAPI, api_method
 import zipline.utils.events
 from zipline.utils.events import (
@@ -143,12 +141,13 @@ class TradingAlgorithm(object):
         """
         self.datetime = None
 
-        self.registered_transforms = {}
-        self.transforms = []
         self.sources = []
 
         # List of trading controls to be used to validate orders.
         self.trading_controls = []
+
+        # List of account controls to be checked on each bar.
+        self.account_controls = []
 
         self._recorded_vars = {}
         self.namespace = kwargs.get('namespace', {})
@@ -277,6 +276,11 @@ class TradingAlgorithm(object):
 
         self._handle_data(self, data)
 
+        # Unlike trading controls which remain constant unless placing an
+        # order, account controls can change each bar. Thus, must check
+        # every bar no matter if the algorithm places an order or not.
+        self.validate_account_controls()
+
     def analyze(self, perf):
         if self._analyze is None:
             return
@@ -312,8 +316,8 @@ class TradingAlgorithm(object):
 
     def _create_data_generator(self, source_filter, sim_params=None):
         """
-        Create a merged data generator using the sources and
-        transforms attached to this algorithm.
+        Create a merged data generator using the sources attached to this
+        algorithm.
 
         ::source_filter:: is a method that receives events in date
         sorted order, and returns True for those events that should be
@@ -325,11 +329,13 @@ class TradingAlgorithm(object):
 
         if self.benchmark_return_source is None:
             env = trading.environment
-            if (sim_params.data_frequency == 'minute'
-                    or sim_params.emission_rate == 'minute'):
-                update_time = lambda date: env.get_open_and_close(date)[1]
+            if sim_params.data_frequency == 'minute' or \
+               sim_params.emission_rate == 'minute':
+                def update_time(date):
+                    return env.get_open_and_close(date)[1]
             else:
-                update_time = lambda date: date
+                def update_time(date):
+                    return date
             benchmark_return_source = [
                 Event({'dt': update_time(dt),
                        'returns': ret,
@@ -337,8 +343,8 @@ class TradingAlgorithm(object):
                        'source_id': 'benchmarks'})
                 for dt, ret in
                 trading.environment.benchmark_returns.iteritems()
-                if dt.date() >= sim_params.period_start.date()
-                and dt.date() <= sim_params.period_end.date()
+                if dt.date() >= sim_params.period_start.date() and
+                dt.date() <= sim_params.period_end.date()
             ]
         else:
             benchmark_return_source = self.benchmark_return_source
@@ -348,11 +354,8 @@ class TradingAlgorithm(object):
         if source_filter:
             date_sorted = filter(source_filter, date_sorted)
 
-        with_tnfms = sequential_transforms(date_sorted,
-                                           *self.transforms)
-
         with_benchmarks = date_sorted_sources(benchmark_return_source,
-                                              with_tnfms)
+                                              date_sorted)
 
         # Group together events with the same dt field. This depends on the
         # events already being sorted.
@@ -360,8 +363,7 @@ class TradingAlgorithm(object):
 
     def _create_generator(self, sim_params, source_filter=None):
         """
-        Create a basic generator setup using the sources and
-        transforms attached to this algorithm.
+        Create a basic generator setup using the sources to this algorithm.
 
         ::source_filter:: is a method that receives events in date
         sorted order, and returns True for those events that should be
@@ -457,23 +459,11 @@ class TradingAlgorithm(object):
                 self.sim_params.data_frequency,
             )
 
-        # Create transforms by wrapping them into StatefulTransforms
-        self.transforms = []
-        for namestring, trans_descr in iteritems(self.registered_transforms):
-            sf = StatefulTransform(
-                trans_descr['class'],
-                *trans_descr['args'],
-                **trans_descr['kwargs']
-            )
-            sf.namestring = namestring
-
-            self.transforms.append(sf)
-
         # force a reset of the performance tracker, in case
         # this is a repeat run of the algorithm.
         self.perf_tracker = None
 
-        # create transforms and zipline
+        # create zipline
         self.gen = self._create_generator(self.sim_params)
 
         with ZiplineAPI(self):
@@ -852,10 +842,6 @@ class TradingAlgorithm(object):
         assert isinstance(sources, list)
         self.sources = sources
 
-    def set_transforms(self, transforms):
-        assert isinstance(transforms, list)
-        self.transforms = transforms
-
     # Remain backwards compatibility
     @property
     def data_frequency(self):
@@ -1024,6 +1010,33 @@ class TradingAlgorithm(object):
             ffill,
         )
         return self.history_container.get_history(history_spec, self.datetime)
+
+    ####################
+    # Account Controls #
+    ####################
+
+    def register_account_control(self, control):
+        """
+        Register a new AccountControl to be checked on each bar.
+        """
+        if self.initialized:
+            raise RegisterAccountControlPostInit()
+        self.account_controls.append(control)
+
+    def validate_account_controls(self):
+        for control in self.account_controls:
+            control.validate(self.updated_portfolio(),
+                             self.updated_account(),
+                             self.get_datetime(),
+                             self.trading_client.current_data)
+
+    @api_method
+    def set_max_leverage(self, max_leverage=None):
+        """
+        Set a limit on the maximum leverage of the algorithm.
+        """
+        control = MaxLeverage(max_leverage)
+        self.register_account_control(control)
 
     ####################
     # Trading Controls #

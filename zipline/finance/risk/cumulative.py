@@ -35,6 +35,10 @@ from . risk import (
     sortino_ratio,
 )
 
+from zipline.utils.serialization_utils import (
+    VERSION_LABEL
+)
+
 log = logbook.Logger('Risk Cumulative')
 
 
@@ -58,17 +62,15 @@ def information_ratio(algo_volatility, algorithm_return, benchmark_return):
     if zp_math.tolerant_equals(algo_volatility, 0):
         return np.nan
 
-    return (
-        (algorithm_return - benchmark_return)
-        # The square of the annualization factor is in the volatility,
-        # because the volatility is also annualized,
-        # i.e. the sqrt(annual factor) is in the volatility's numerator.
-        # So to have the the correct annualization factor for the
-        # Sharpe value's numerator, which should be the sqrt(annual factor).
-        # The square of the sqrt of the annual factor, i.e. the annual factor
-        # itself, is needed in the numerator to factor out the division by
-        # its square root.
-        / algo_volatility)
+    # The square of the annualization factor is in the volatility,
+    # because the volatility is also annualized,
+    # i.e. the sqrt(annual factor) is in the volatility's numerator.
+    # So to have the the correct annualization factor for the
+    # Sharpe value's numerator, which should be the sqrt(annual factor).
+    # The square of the sqrt of the annual factor, i.e. the annual factor
+    # itself, is needed in the numerator to factor out the division by
+    # its square root.
+    return (algorithm_return - benchmark_return) / algo_volatility
 
 
 class RiskMetricsCumulative(object):
@@ -91,7 +93,8 @@ class RiskMetricsCumulative(object):
 
     def __init__(self, sim_params,
                  returns_frequency=None,
-                 create_first_day_stats=False):
+                 create_first_day_stats=False,
+                 account=None):
         """
         - @returns_frequency allows for configuration of the whether
         the benchmark and algorithm returns are in units of minutes or days,
@@ -141,6 +144,7 @@ class RiskMetricsCumulative(object):
 
         self.algorithm_returns_cont = pd.Series(index=cont_index)
         self.benchmark_returns_cont = pd.Series(index=cont_index)
+        self.algorithm_cumulative_leverages_cont = pd.Series(index=cont_index)
         self.mean_returns_cont = pd.Series(index=cont_index)
         self.annualized_mean_returns_cont = pd.Series(index=cont_index)
         self.mean_benchmark_returns_cont = pd.Series(index=cont_index)
@@ -158,6 +162,7 @@ class RiskMetricsCumulative(object):
 
         self.algorithm_cumulative_returns = pd.Series(index=cont_index)
         self.benchmark_cumulative_returns = pd.Series(index=cont_index)
+        self.algorithm_cumulative_leverages = pd.Series(index=cont_index)
         self.excess_returns = pd.Series(index=cont_index)
 
         self.latest_dt = cont_index[0]
@@ -169,6 +174,8 @@ class RiskMetricsCumulative(object):
         self.drawdowns = pd.Series(index=cont_index)
         self.max_drawdowns = pd.Series(index=cont_index)
         self.max_drawdown = 0
+        self.max_leverages = pd.Series(index=cont_index)
+        self.max_leverage = 0
         self.current_max = -np.inf
         self.daily_treasury = pd.Series(index=self.trading_days)
         self.treasury_period_return = np.nan
@@ -193,7 +200,7 @@ class RiskMetricsCumulative(object):
     def get_daily_index(self):
         return self.trading_days
 
-    def update(self, dt, algorithm_returns, benchmark_returns):
+    def update(self, dt, algorithm_returns, benchmark_returns, account):
         # Keep track of latest dt for use in to_dict and other methods
         # that report current state.
         self.latest_dt = dt
@@ -259,6 +266,16 @@ class RiskMetricsCumulative(object):
         self.annualized_mean_benchmark_returns = \
             self.annualized_mean_benchmark_returns_cont[:dt]
 
+        self.algorithm_cumulative_leverages_cont[dt] = account['leverage']
+        self.algorithm_cumulative_leverages = \
+            self.algorithm_cumulative_leverages_cont[:dt]
+
+        if self.create_first_day_stats:
+            if len(self.algorithm_cumulative_leverages) == 1:
+                self.algorithm_cumulative_leverages = pd.Series(
+                    {self.day_before_start: 0.0}).append(
+                    self.algorithm_cumulative_leverages)
+
         if not self.algorithm_returns.index.equals(
             self.benchmark_returns.index
         ):
@@ -293,8 +310,7 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
             self.daily_treasury[treasury_end] = treasury_period_return
         self.treasury_period_return = self.daily_treasury[treasury_end]
         self.excess_returns[self.latest_dt] = (
-            self.algorithm_cumulative_returns[self.latest_dt]
-            -
+            self.algorithm_cumulative_returns[self.latest_dt] -
             self.treasury_period_return)
         self.metrics.beta[dt] = self.calculate_beta()
         self.metrics.alpha[dt] = self.calculate_alpha()
@@ -304,6 +320,8 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         self.metrics.information[dt] = self.calculate_information()
         self.max_drawdown = self.calculate_max_drawdown()
         self.max_drawdowns[dt] = self.max_drawdown
+        self.max_leverage = self.calculate_max_leverage()
+        self.max_leverages[dt] = self.max_leverage
 
     def to_dict(self):
         """
@@ -330,6 +348,7 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
             'information': self.metrics.information[dt],
             'excess_return': self.excess_returns[dt],
             'max_drawdown': self.max_drawdown,
+            'max_leverage': self.max_leverage,
             'period_label': period_label
         }
 
@@ -372,8 +391,7 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         # exceed the previous max_drawdown iff the current return is lower than
         # the previous low in the current drawdown window.
         cur_drawdown = 1.0 - (
-            (1.0 + self.algorithm_cumulative_returns[self.latest_dt])
-            /
+            (1.0 + self.algorithm_cumulative_returns[self.latest_dt]) /
             (1.0 + self.current_max))
 
         self.drawdowns[self.latest_dt] = cur_drawdown
@@ -382,6 +400,14 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
             return cur_drawdown
         else:
             return self.max_drawdown
+
+    def calculate_max_leverage(self):
+        # The leverage is defined as: the gross_exposure/net_liquidation
+        # gross_exposure = long_exposure + abs(short_exposure)
+        # net_liquidation = ending_cash + long_exposure + short_exposure
+        cur_leverage = self.algorithm_cumulative_leverages[self.latest_dt]
+
+        return max(cur_leverage, self.max_leverage)
 
     def calculate_sharpe(self):
         """
@@ -454,3 +480,28 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         beta = algorithm_covariance / benchmark_variance
 
         return beta
+
+    def __getstate__(self):
+        state_dict = \
+            {k: v for k, v in iteritems(self.__dict__) if
+                (not k.startswith('_') and not k == 'treasury_curves')}
+
+        STATE_VERSION = 2
+        state_dict[VERSION_LABEL] = STATE_VERSION
+
+        return state_dict
+
+    def __setstate__(self, state):
+
+        OLDEST_SUPPORTED_STATE = 2
+        version = state.pop(VERSION_LABEL)
+
+        if version < OLDEST_SUPPORTED_STATE:
+            raise BaseException("RiskMetricsCumulative \
+                    saved state is too old.")
+
+        self.__dict__.update(state)
+
+        # This are big and we don't need to serialize them
+        # pop them back in now
+        self.treasury_curves = trading.environment.treasury_curves

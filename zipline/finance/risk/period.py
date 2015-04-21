@@ -36,6 +36,10 @@ from . risk import (
     sortino_ratio,
 )
 
+from zipline.utils.serialization_utils import (
+    VERSION_LABEL
+)
+
 log = logbook.Logger('Risk Period')
 
 choose_treasury = functools.partial(risk.choose_treasury,
@@ -44,7 +48,8 @@ choose_treasury = functools.partial(risk.choose_treasury,
 
 class RiskMetricsPeriod(object):
     def __init__(self, start_date, end_date, returns,
-                 benchmark_returns=None):
+                 benchmark_returns=None,
+                 algorithm_leverages=None):
 
         treasury_curves = trading.environment.treasury_curves
         if treasury_curves.index[-1] >= start_date:
@@ -67,6 +72,8 @@ class RiskMetricsPeriod(object):
 
         self.algorithm_returns = self.mask_returns_to_period(returns)
         self.benchmark_returns = self.mask_returns_to_period(benchmark_returns)
+        self.algorithm_leverages = algorithm_leverages
+
         self.calculate_metrics()
 
     def calculate_metrics(self):
@@ -97,10 +104,8 @@ class RiskMetricsPeriod(object):
             index=self.algorithm_returns.index)
         for dt, ret in self.algorithm_returns.iteritems():
             self.mean_algorithm_returns[dt] = (
-                self.algorithm_returns[:dt].sum()
-                /
-                self.trading_day_counts[dt]
-            )
+                self.algorithm_returns[:dt].sum() /
+                self.trading_day_counts[dt])
 
         self.benchmark_volatility = self.calculate_volatility(
             self.benchmark_returns)
@@ -129,6 +134,7 @@ class RiskMetricsPeriod(object):
         self.excess_return = self.algorithm_period_returns - \
             self.treasury_period_return
         self.max_drawdown = self.calculate_max_drawdown()
+        self.max_leverage = self.calculate_max_leverage()
 
     def to_dict(self):
         """
@@ -150,6 +156,7 @@ class RiskMetricsPeriod(object):
             'alpha': self.alpha,
             'excess_return': self.excess_return,
             'max_drawdown': self.max_drawdown,
+            'max_leverage': self.max_leverage,
             'period_label': period_label
         }
 
@@ -173,6 +180,7 @@ class RiskMetricsPeriod(object):
             "beta",
             "alpha",
             "max_drawdown",
+            "max_leverage",
             "algorithm_returns",
             "benchmark_returns",
             "condition_number",
@@ -282,12 +290,13 @@ class RiskMetricsPeriod(object):
         for r in self.algorithm_returns:
             try:
                 cur_return += math.log(1.0 + r)
-            # this is a guard for a single day returning -100%
+            # this is a guard for a single day returning -100%, if returns are
+            # greater than -1.0 it will throw an error because you cannot take
+            # the log of a negative number
             except ValueError:
                 log.debug("{cur} return, zeroing the returns".format(
                     cur=cur_return))
                 cur_return = 0.0
-                # BUG? Shouldn't this be set to log(1.0 + 0) ?
             compounded_returns.append(cur_return)
 
         cur_max = None
@@ -304,3 +313,32 @@ class RiskMetricsPeriod(object):
             return 0.0
 
         return 1.0 - math.exp(max_drawdown)
+
+    def calculate_max_leverage(self):
+        if self.algorithm_leverages is None:
+            return 0.0
+        else:
+            return max(self.algorithm_leverages.values)
+
+    def __getstate__(self):
+        state_dict = \
+            {k: v for k, v in iteritems(self.__dict__) if
+             (not k.startswith('_') and not k == 'treasury_curves')}
+
+        STATE_VERSION = 2
+        state_dict[VERSION_LABEL] = STATE_VERSION
+
+        return state_dict
+
+    def __setstate__(self, state):
+
+        OLDEST_SUPPORTED_STATE = 2
+        version = state.pop(VERSION_LABEL)
+
+        if version < OLDEST_SUPPORTED_STATE:
+            raise BaseException("RiskMetricsPeriod saved state \
+                    is too old.")
+
+        self.__dict__.update(state)
+
+        self.treasury_curves = trading.environment.treasury_curves

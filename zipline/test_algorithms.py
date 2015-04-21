@@ -80,7 +80,12 @@ from six.moves import range
 from six import itervalues
 
 from zipline.algorithm import TradingAlgorithm
-from zipline.api import FixedSlippage
+from zipline.api import (
+    FixedSlippage,
+    order,
+    set_slippage,
+    record,
+)
 from zipline.errors import UnsupportedOrderParameters
 from zipline.finance.execution import (
     LimitOrder,
@@ -88,6 +93,7 @@ from zipline.finance.execution import (
     StopLimitOrder,
     StopOrder,
 )
+from zipline.transforms import BatchTransform, batch_transform
 
 
 class TestAlgorithm(TradingAlgorithm):
@@ -364,8 +370,8 @@ class TestOrderPercentAlgorithm(TradingAlgorithm):
 
         self.order_percent(0, .001)
         self.target_shares += np.floor((.001 *
-                                        self.portfolio.portfolio_value)
-                                       / data[0].price)
+                                        self.portfolio.portfolio_value) /
+                                       data[0].price)
 
 
 class TestTargetPercentAlgorithm(TradingAlgorithm):
@@ -410,6 +416,16 @@ class TestTargetValueAlgorithm(TradingAlgorithm):
 
 
 ############################
+# AccountControl Test Algos#
+############################
+
+
+class SetMaxLeverageAlgorithm(TradingAlgorithm):
+    def initialize(self, max_leverage=None):
+        self.set_max_leverage(max_leverage=max_leverage)
+
+
+############################
 # TradingControl Test Algos#
 ############################
 
@@ -446,9 +462,6 @@ class SetLongOnlyAlgorithm(TradingAlgorithm):
     def initialize(self):
         self.order_count = 0
         self.set_long_only()
-
-
-from zipline.transforms import BatchTransform, batch_transform
 
 
 class TestRegisterTransformAlgorithm(TradingAlgorithm):
@@ -870,10 +883,6 @@ class InvalidOrderAlgorithm(TradingAlgorithm):
 
 ##############################
 # Quantopian style algorithms
-from zipline.api import (order,
-                         set_slippage,
-                         record)
-
 
 # Noop algo
 def initialize_noop(context):

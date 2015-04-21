@@ -1,6 +1,5 @@
-
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2015 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +16,7 @@
 """
 Tools to generate data sources.
 """
+import numpy as np
 import pandas as pd
 
 from zipline.gens.utils import hash_args
@@ -26,16 +26,14 @@ from zipline.sources.data_source import DataSource
 
 class DataFrameSource(DataSource):
     """
-    Yields all events in event_list that match the given sid_filter.
-    If no event_list is specified, generates an internal stream of events
-    to filter.  Returns all events if filter is None.
+    Data source that yields from a pandas DataFrame.
 
-    Configuration options:
+    :Axis layout:
+        * columns : sids
+        * index : datetime
 
-    sids   : list of values representing simulated internal sids
-    start  : start date
-    delta  : timedelta between internal events
-    filter : filter to remove the sids
+    :Note:
+        Bars where the price is nan are filtered out.
     """
 
     def __init__(self, data, **kwargs):
@@ -51,6 +49,8 @@ class DataFrameSource(DataSource):
         self.arg_string = hash_args(data, **kwargs)
 
         self._raw_data = None
+
+        self.started_sids = set()
 
     @property
     def mapping(self):
@@ -69,6 +69,12 @@ class DataFrameSource(DataSource):
         for dt, series in self.data.iterrows():
             for sid, price in series.iteritems():
                 if sid in self.sids:
+                    # Skip SIDs that can not be forward filled
+                    if np.isnan(price) and \
+                       sid not in self.started_sids:
+                        continue
+                    self.started_sids.add(sid)
+
                     event = {
                         'dt': dt,
                         'sid': sid,
@@ -88,16 +94,15 @@ class DataFrameSource(DataSource):
 
 class DataPanelSource(DataSource):
     """
-    Yields all events in event_list that match the given sid_filter.
-    If no event_list is specified, generates an internal stream of events
-    to filter.  Returns all events if filter is None.
+    Data source that yields from a pandas Panel.
 
-    Configuration options:
+    :Axis layout:
+        * items : sids
+        * major_axis : datetime
+        * minor_axis : price, volume, ...
 
-    sids   : list of values representing simulated internal sids
-    start  : start date
-    delta  : timedelta between internal events
-    filter : filter to remove the sids
+    :Note:
+        Bars where the price is nan are filtered out.
     """
 
     def __init__(self, data, **kwargs):
@@ -113,6 +118,8 @@ class DataPanelSource(DataSource):
         self.arg_string = hash_args(data, **kwargs)
 
         self._raw_data = None
+
+        self.started_sids = set()
 
     @property
     def mapping(self):
@@ -140,6 +147,12 @@ class DataPanelSource(DataSource):
             df = self.data.major_xs(dt)
             for sid, series in df.iteritems():
                 if sid in self.sids:
+                    # Skip SIDs that can not be forward filled
+                    if np.isnan(series['price']) and \
+                       sid not in self.started_sids:
+                        continue
+                    self.started_sids.add(sid)
+
                     event = {
                         'dt': dt,
                         'sid': sid,
